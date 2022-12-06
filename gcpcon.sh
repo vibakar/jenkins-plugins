@@ -3,10 +3,10 @@
 environments__list=("mgmt_pre" "mgmt_prd")
 environments__list__names=("MGMT-PRE" "MGMT-PRD")
 
-mgmt_pre__actions_list=("enable_autopilot" "cleanup_pvc" "upgrade_vault")
-mgmt_pre__actions_list__names=("Enable autopilot" "Cleanup PVC" "Upgrade Vault")
+mgmt_pre__actions_list=("enable_autopilot" "cleanup_pvc" "upgrade_vault" "drain_nodes")
+mgmt_pre__actions_list__names=("Enable autopilot" "Cleanup PVC" "Upgrade Vault" "Drain nodes")
 
-###
+### MGMT-PRE
 mgmt_pre__name="MGMT-PRE"
 mgmt_pre__regions_list=("euwe1" "euwe2")
 mgmt_pre__regions_list__names=("EUWE1 (Secondary)" "EUWE2 (Primary)")
@@ -28,7 +28,8 @@ mgmt_pre__euwe2__project="mgmt-ctu-pre-4195"
 mgmt_pre__euwe2__cluster="mgmt-ctu-pre-01-kcl-01-euwe2"
 mgmt_pre__euwe2__gcpregion="europe-west2"
 mgmt_pre__euwe2__pod_name="hcv2-vault-0"
-###
+
+### MGMT-PRD
 mgmt_prd__name="MGMT-PRD"
 mgmt_prd__regions_list=("euwe1prd" "euwe2prd" "euwe1nprd" "euwe2nprd")
 mgmt_prd__regions_list__names=("EUWE1-Prod (Secondary)" "EUWE2-Prod (Primary)" "EUWE1-NonProd (Secondary)" "EUWE2-NonProd (Primary)")
@@ -173,6 +174,7 @@ function mgmt_pre_actions_menu() {
 
 function enable_autopilot() {
     local vault_username
+    local vault_password
 
     declare -n pod_name="${environment}__${region}__pod_name"
 
@@ -181,24 +183,40 @@ function enable_autopilot() {
     print_action "Please provide your vault credentials."
     echo -e "Type your username and press enter:"
     read vault_username
+    echo -e "Type your password and press enter (the password won't be displayed):"
+    read -s vault_password
 
-    kubectl exec ${pod_name} -- vault login -method=ldap username=${vault_username}
+    kubectl exec ${pod_name} -- vault login -method=ldap username=${vault_username} password=${vault_password}
     kubectl exec ${pod_name} -- vault operator raft autopilot set-config -cleanup-dead-servers=true -dead-server-last-contact-threshold=24h -last-contact-threshold=1m -max-trailing-logs=100 -min-quorum=3 -server-stabilization-time=10s
     kubectl exec ${pod_name} -- vault operator raft autopilot get-config
     kubectl exec ${pod_name} -- vault operator raft list-peers
+    kubectl exec ${pod_name} -- rm -rf /home/vault/.vault-token
 }
 
 function cleanup_pvc() {
+    local pvc_name_input
     local pvc_names
 
     echo -e
     print_info "Getting pods and pvc info."
     kubectl get pods
-    kubectl get pvc
-    echo -e
-    print_action "Type the pvc names you want to delete (separated by space) then press enter."
-    read pvc_names
-    kubectl delete pvc ${pvc_names}
+    pvc_names=($(kubectl get pvc | grep data | awk -F ' ' '{printf "%s ", $1}'))
+    while : 
+    do
+        echo -e
+        print_action "Please select a pvc you want to cleanup."
+        for ((idx=0; idx<${#pvc_names[@]}; ++idx)); do
+            echo "$idx" "${pvc_names[idx]}"
+        done
+        echo -e "$idx Exit program"
+
+        read pvc_name_input
+        if [[ ${pvc_name_input} == $idx ]]; then echo -e "Goodbye" && return 1; fi
+        if [[ ${pvc_name_input} > ${#pvc_names[@]} ]] || [[ -z ${pvc_name_input} ]]; then print_info "Selection unknown." && return 1; fi
+
+        print_info "Cleaning-up pvc: ${pvc_names[${pvc_name_input}]}"
+        kubectl delete pvc ${pvc_names[${pvc_name_input}]}
+    done
 }
 
 function upgrade_vault() {
@@ -221,7 +239,7 @@ function upgrade_vault() {
     if [[ "${upgrade_input_1}" == "1" ]]; then
         echo -e
         print_action "Please confirm if you will like to upgrade Vault."
-        echo -e [y/N]
+        echo -e "[y/n]"
         read upgrade_input_2
 
         if [[ -z ${upgrade_input_2} ]]; then print_info "Selection unknown." && return 1; fi
@@ -245,6 +263,45 @@ function upgrade_vault() {
     else
         print_info "Selection unknown." && return 1;
     fi
+}
+
+function drain_nodes() {
+    local drain_input
+    local pod_name_suffix
+    local vault_nodes_excluded
+    local vault_nodes_included
+
+    declare -n pod_name="${environment}__${region}__pod_name"
+    pod_name_suffix="${pod_name::-2}"
+    
+    echo -e
+    print_action "Drain nodes"
+
+    print_info "Looking for pods starting with: ${pod_name_suffix}"
+
+    vault_nodes_excluded=$(kubectl get pods -o wide | grep ${pod_name_suffix} | awk -F ' ' '{printf "%s ", $7}')
+    vault_nodes_excluded="${vault_nodes_excluded::-1}"
+    print_info "Ignoring the following nodes: "
+    for vault_node_excluded in ${vault_nodes_excluded[@]}; do
+        echo -e "- ${vault_node_excluded}"
+    done
+    vault_nodes_excluded="${vault_nodes_excluded// /|}"
+    vault_nodes_excluded="${vault_nodes_excluded}|NAME"
+
+    vault_nodes_included=($(kubectl get nodes | grep -v -E ${vault_nodes_excluded} | awk -F ' ' '{printf "%s ", $1}'))
+    echo -e
+    print_action "Please select a node you want to drain."
+    for ((idx=0; idx<${#vault_nodes_included[@]}; ++idx)); do
+        echo "$idx" "${vault_nodes_included[idx]}"
+    done
+    echo -e "$idx Exit program"
+
+    read drain_input
+    if [[ ${drain_input} == $idx ]]; then echo -e "Goodbye" && return 1; fi
+    if [[ ${drain_input} > ${#vault_nodes_included[@]} ]] || [[ -z ${drain_input} ]]; then print_info "Selection unknown." && return 1; fi
+
+    print_info "Draining node: ${vault_nodes_included[${drain_input}]}"
+    kubectl drain ${vault_nodes_included[${drain_input}]} --ignore-daemonsets
 }
 
 select_environment environment
